@@ -267,7 +267,8 @@ def find_all_schedules(service, sheet_id, target_name):
     return all_s
 
 
-def event_exists(cal_service, event_name, event_datetime):
+def check_and_update_event(cal_service, event_name, event_datetime, location=""):
+    """이벤트 존재 확인 + 위치 없으면 업데이트"""
     try:
         day_start = event_datetime.replace(hour=0, minute=0, second=0)
         day_end = day_start + timedelta(days=1)
@@ -277,7 +278,20 @@ def event_exists(cal_service, event_name, event_datetime):
             timeMax=day_end.isoformat() + '+09:00',
             q=event_name, singleEvents=True
         ).execute()
-        return any(e.get('summary', '') == event_name for e in result.get('items', []))
+
+        for event in result.get('items', []):
+            if event.get('summary', '') == event_name:
+                # 이벤트 있음 → 위치가 비어있고 우리가 위치 정보 가지고 있으면 업데이트
+                if location and not event.get('location'):
+                    event['location'] = location
+                    cal_service.events().update(
+                        calendarId='primary',
+                        eventId=event['id'],
+                        body=event
+                    ).execute()
+                    print(f"  📍 위치 업데이트됨: {location}")
+                return True
+        return False
     except Exception as e:
         print(f"  ⚠️  중복 체크 오류: {e}")
         return False
@@ -321,14 +335,15 @@ def send_telegram_message(message):
 # ==========================================================
 
 def get_upcoming_3days_report(cal_service):
-    """Google Calendar에서 오늘(KST)~3일 후까지 모든 일정 가져오기"""
+    """Google Calendar에서 오늘(KST)부터 3일간 모든 일정 가져오기"""
     try:
         now_kst = datetime.now(KST)
         today_start = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
-        three_days = today_start + timedelta(days=3)
+        # 오늘 포함 3일 = 오늘 00:00 ~ 3일 후 23:59
+        range_end = today_start + timedelta(days=3, hours=23, minutes=59)
 
         time_min = today_start.isoformat()
-        time_max = three_days.isoformat()
+        time_max = range_end.isoformat()
 
         print(f"📋 캘린더 조회: {time_min} ~ {time_max}")
 
@@ -448,7 +463,8 @@ def main():
 
     for s in unique:
         name = s['name']
-        if event_exists(cal_svc, name, s['datetime']):
+        loc = s.get('location', '')
+        if check_and_update_event(cal_svc, name, s['datetime'], loc):
             print(f"⏭️ 건너뜀: {s['datetime'].strftime('%Y-%m-%d')} | {name}")
             skipped += 1
             continue
