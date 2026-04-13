@@ -9,11 +9,14 @@ import pickle
 import base64
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import re
 import requests
 import json
 import urllib.parse
+
+# ===== 한국 시간대 =====
+KST = timezone(timedelta(hours=9))
 
 # ===== 설정 =====
 SHARED_SHEET_ID = "1KYTCcWQ_Ctfy72H7w-aVgJMdFGBWjS2HrOVcLgKjOOQ"
@@ -29,27 +32,25 @@ SCOPES = [
     'https://www.googleapis.com/auth/calendar'
 ]
 
+DAY_NAMES = ['월', '화', '수', '목', '금', '토', '일']
+
 # ==========================================================
 # 인증 (GitHub Actions 버전)
 # ==========================================================
 
 def authenticate():
     """환경변수에서 토큰 로드 → 갱신 → 사용"""
-
-    # 1) 환경변수에서 credentials.json 저장
     creds_json = os.environ.get("CREDENTIALS_JSON", "")
     if creds_json:
         with open("credentials.json", "w") as f:
             f.write(creds_json)
 
-    # 2) 환경변수에서 token.pickle 디코딩
     token_b64 = os.environ.get("TOKEN_PICKLE_BASE64", "")
     if token_b64:
         token_bytes = base64.b64decode(token_b64)
         with open("token.pickle", "wb") as f:
             f.write(token_bytes)
 
-    # 3) 토큰 로드 및 갱신
     creds = None
     if os.path.exists("token.pickle"):
         with open("token.pickle", "rb") as token:
@@ -72,7 +73,6 @@ def authenticate():
 # ==========================================================
 
 def parse_date_staff(date_str, year=2026):
-    """1.스탭: "04월 13일" → datetime"""
     match = re.match(r'(\d{1,2})월\s*(\d{1,2})일', date_str.strip())
     if match:
         try:
@@ -83,7 +83,6 @@ def parse_date_staff(date_str, year=2026):
 
 
 def parse_datetime_cpr(date_str):
-    """CPR교육일정: 다양한 형식 대응"""
     date_str = date_str.strip()
     date_match = re.match(r'(\d{4})\.?\s*(\d{1,2})\.?\s*(\d{1,2})', date_str)
     if not date_match:
@@ -98,7 +97,6 @@ def parse_datetime_cpr(date_str):
 
 
 def parse_datetime_academic(date_str):
-    """3.학술: "2026. 3. 25 수" → datetime"""
     match = re.match(r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})', date_str.strip())
     if match:
         try:
@@ -304,11 +302,17 @@ def add_event_to_calendar(service, name, dt, details, duration_hours=1, location
 def send_telegram_message(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp = requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML', 'disable_web_page_preview': True})
+        payload = {
+            'chat_id': TELEGRAM_CHAT_ID,
+            'text': message,
+            'parse_mode': 'HTML',
+            'disable_web_page_preview': 'true'
+        }
+        resp = requests.post(url, data=payload)
         if resp.status_code == 200:
             print("📱 텔레그램 발송 완료!")
         else:
-            print(f"❌ 텔레그램 실패: {resp.text}")
+            print(f"❌ 텔레그램 실패: {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"❌ 텔레그램 오류: {e}")
 
@@ -317,21 +321,27 @@ def send_telegram_message(message):
 # ==========================================================
 
 def get_upcoming_3days_report(cal_service):
-    """Google Calendar에서 오늘~3일 후까지 모든 일정 가져오기"""
+    """Google Calendar에서 오늘(KST)~3일 후까지 모든 일정 가져오기"""
     try:
-        now = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-        three_days = now + timedelta(days=3)
+        now_kst = datetime.now(KST)
+        today_start = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+        three_days = today_start + timedelta(days=3)
+
+        time_min = today_start.isoformat()
+        time_max = three_days.isoformat()
+
+        print(f"📋 캘린더 조회: {time_min} ~ {time_max}")
 
         events_result = cal_service.events().list(
             calendarId='primary',
-            timeMin=now.isoformat() + '+09:00',
-            timeMax=three_days.isoformat() + '+09:00',
+            timeMin=time_min,
+            timeMax=time_max,
             singleEvents=True,
             orderBy='startTime'
         ).execute()
 
         events = events_result.get('items', [])
-        day_names = ['월', '화', '수', '목', '금', '토', '일']
+        print(f"📋 캘린더에서 {len(events)}개 일정 조회됨")
 
         if not events:
             return "📋 3일 내 예정된 일정 없음\n\n"
@@ -341,27 +351,34 @@ def get_upcoming_3days_report(cal_service):
 
         current_date = None
         for event in events:
-            # 시간 파싱 (종일 일정 vs 시간 지정 일정)
-            start = event['start']
+            start = event.get('start', {})
             if 'dateTime' in start:
-                dt = datetime.fromisoformat(start['dateTime'].replace('Z', '+00:00'))
+                dt_str = start['dateTime']
+                # +09:00 또는 Z 형식 처리
+                if '+' in dt_str[10:] or dt_str.endswith('Z'):
+                    dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00'))
+                    dt = dt.astimezone(KST)
+                else:
+                    dt = datetime.fromisoformat(dt_str)
                 time_str = dt.strftime('%H:%M')
-            else:
+            elif 'date' in start:
                 dt = datetime.strptime(start['date'], '%Y-%m-%d')
                 time_str = "종일"
+            else:
+                continue
 
-            # 날짜별 구분
             date_key = dt.strftime('%Y-%m-%d')
             if date_key != current_date:
                 current_date = date_key
-                day_name = day_names[dt.weekday()]
-                report += f"\n<b>📆 {dt.strftime(f'%m/%d')}({day_name})</b>\n"
+                day_name = DAY_NAMES[dt.weekday()]
+                report += f"\n<b>📆 {dt.strftime('%m/%d')}({day_name})</b>\n"
 
             summary = event.get('summary', '(제목 없음)')
             location = event.get('location', '')
             report += f"  ▪️ {time_str} {summary}\n"
             if location:
-                naver_url = f"https://map.naver.com/v5/search/{urllib.parse.quote(location)}"
+                encoded = urllib.parse.quote(location)
+                naver_url = f"https://map.naver.com/v5/search/{encoded}"
                 report += f"      📍 <a href=\"{naver_url}\">{location}</a>\n"
 
         report += "\n"
@@ -369,7 +386,9 @@ def get_upcoming_3days_report(cal_service):
 
     except Exception as e:
         print(f"⚠️ 캘린더 조회 오류: {e}")
-        return "📋 캘린더 일정 조회 실패\n\n"
+        import traceback
+        traceback.print_exc()
+        return f"📋 캘린더 일정 조회 실패: {str(e)}\n\n"
 
 # ==========================================================
 # 메인
@@ -409,8 +428,9 @@ def main():
             seen.add(key)
     unique.sort(key=lambda x: x['datetime'])
 
-    # 오늘 이전 제외
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    # 오늘(KST) 이전 제외
+    now_kst = datetime.now(KST)
+    today = now_kst.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
     filtered = len(unique)
     unique = [s for s in unique if s['datetime'] >= today]
     if filtered - len(unique) > 0:
@@ -446,12 +466,11 @@ def main():
         else:
             print(f"  ❌ 실패: {name}")
 
-    # 텔레그램 보고
-    day_names = ['월', '화', '수', '목', '금', '토', '일']
-    now = datetime.now()
-    now_day = day_names[now.weekday()]
+    # ★ 텔레그램 보고 (KST 시간 사용)
+    now_kst = datetime.now(KST)
+    now_day = DAY_NAMES[now_kst.weekday()]
     report = f"📅 <b>교육 일정 동기화 보고</b>\n"
-    report += f"⏰ {now.strftime(f'%Y-%m-%d ({now_day}) %H:%M')}\n"
+    report += f"⏰ {now_kst.strftime('%Y-%m-%d')} ({now_day}) {now_kst.strftime('%H:%M')}\n"
     report += f"📊 새로 추가: <b>{added}</b>개\n"
     report += f"⏭️ 중복 건너뜀: <b>{skipped}</b>개\n\n"
 
