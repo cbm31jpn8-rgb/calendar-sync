@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import re
 import requests
 import json
+import urllib.parse
 
 # ===== 설정 =====
 SHARED_SHEET_ID = "1KYTCcWQ_Ctfy72H7w-aVgJMdFGBWjS2HrOVcLgKjOOQ"
@@ -201,9 +202,10 @@ def find_in_cpr_sheet(service, sheet_id, target_name):
                 schedules.append({
                     'sheet': 'CPR교육일정', 'name': f"CPR교육 - {region}",
                     'datetime': parsed_dt,
+                    'location': venue,
                     'details': f"지역: {region}, 장소: {venue}, 주강사: {instructor}"
                 })
-                print(f"  ✅ {date_str} - {region}")
+                print(f"  ✅ {date_str} - {region} ({venue})")
     except Exception as e:
         print(f"⚠️  CPR교육일정 오류: {e}")
     return schedules
@@ -283,7 +285,7 @@ def event_exists(cal_service, event_name, event_datetime):
         return False
 
 
-def add_event_to_calendar(service, name, dt, details, duration_hours=1):
+def add_event_to_calendar(service, name, dt, details, duration_hours=1, location=""):
     try:
         event = {
             'summary': name,
@@ -291,6 +293,8 @@ def add_event_to_calendar(service, name, dt, details, duration_hours=1):
             'end': {'dateTime': (dt + timedelta(hours=duration_hours)).isoformat(), 'timeZone': 'Asia/Seoul'},
             'description': f'시트에서 자동 추가됨\n{details}'
         }
+        if location:
+            event['location'] = location
         return service.events().insert(calendarId='primary', body=event).execute()
     except Exception as e:
         print(f"❌ 캘린더 추가 오류: {e}")
@@ -300,13 +304,72 @@ def add_event_to_calendar(service, name, dt, details, duration_hours=1):
 def send_telegram_message(message):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        resp = requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'})
+        resp = requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML', 'disable_web_page_preview': True})
         if resp.status_code == 200:
             print("📱 텔레그램 발송 완료!")
         else:
             print(f"❌ 텔레그램 실패: {resp.text}")
     except Exception as e:
         print(f"❌ 텔레그램 오류: {e}")
+
+# ==========================================================
+# ★ 캘린더에서 3일간 일정 조회
+# ==========================================================
+
+def get_upcoming_3days_report(cal_service):
+    """Google Calendar에서 오늘~3일 후까지 모든 일정 가져오기"""
+    try:
+        now = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        three_days = now + timedelta(days=3)
+
+        events_result = cal_service.events().list(
+            calendarId='primary',
+            timeMin=now.isoformat() + '+09:00',
+            timeMax=three_days.isoformat() + '+09:00',
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        events = events_result.get('items', [])
+        day_names = ['월', '화', '수', '목', '금', '토', '일']
+
+        if not events:
+            return "📋 3일 내 예정된 일정 없음\n\n"
+
+        report = "📋 <b>앞으로 3일간 일정 (캘린더)</b>\n"
+        report += "-" * 30 + "\n"
+
+        current_date = None
+        for event in events:
+            # 시간 파싱 (종일 일정 vs 시간 지정 일정)
+            start = event['start']
+            if 'dateTime' in start:
+                dt = datetime.fromisoformat(start['dateTime'].replace('Z', '+00:00'))
+                time_str = dt.strftime('%H:%M')
+            else:
+                dt = datetime.strptime(start['date'], '%Y-%m-%d')
+                time_str = "종일"
+
+            # 날짜별 구분
+            date_key = dt.strftime('%Y-%m-%d')
+            if date_key != current_date:
+                current_date = date_key
+                day_name = day_names[dt.weekday()]
+                report += f"\n<b>📆 {dt.strftime(f'%m/%d')}({day_name})</b>\n"
+
+            summary = event.get('summary', '(제목 없음)')
+            location = event.get('location', '')
+            report += f"  ▪️ {time_str} {summary}\n"
+            if location:
+                naver_url = f"https://map.naver.com/v5/search/{urllib.parse.quote(location)}"
+                report += f"      📍 <a href=\"{naver_url}\">{location}</a>\n"
+
+        report += "\n"
+        return report
+
+    except Exception as e:
+        print(f"⚠️ 캘린더 조회 오류: {e}")
+        return "📋 캘린더 일정 조회 실패\n\n"
 
 # ==========================================================
 # 메인
@@ -377,18 +440,25 @@ def main():
         else:
             dur = 1
 
-        if add_event_to_calendar(cal_svc, name, s['datetime'], s['details'], dur):
+        if add_event_to_calendar(cal_svc, name, s['datetime'], s['details'], dur, s.get('location', '')):
             print(f"  ✅ 추가: {name}")
             added += 1
         else:
             print(f"  ❌ 실패: {name}")
 
     # 텔레그램 보고
+    day_names = ['월', '화', '수', '목', '금', '토', '일']
+    now = datetime.now()
+    now_day = day_names[now.weekday()]
     report = f"📅 <b>교육 일정 동기화 보고</b>\n"
-    report += f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+    report += f"⏰ {now.strftime(f'%Y-%m-%d ({now_day}) %H:%M')}\n"
     report += f"📊 새로 추가: <b>{added}</b>개\n"
-    report += f"⏭️ 중복 건너뜀: <b>{skipped}</b>개\n"
-    report += f"✅ 동기화 완료!"
+    report += f"⏭️ 중복 건너뜀: <b>{skipped}</b>개\n\n"
+
+    # ★ 캘린더에서 앞으로 3일간 일정 가져오기
+    report += get_upcoming_3days_report(cal_svc)
+
+    report += "✅ 동기화 완료!"
     send_telegram_message(report)
 
     print(f"\n✅ 완료: 추가 {added}, 건너뜀 {skipped}")
