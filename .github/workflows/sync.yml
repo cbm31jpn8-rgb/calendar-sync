@@ -1,9 +1,9 @@
 name: 교육 일정 동기화
 
 on:
-  # 매일 한국시간 오전 8시 실행 (UTC 23:00 = KST 08:00)
+  # 매일 한국시간 오전 8시 실행 (UTC 22:30 = KST 07:30)
   schedule:
-    - cron: '0 23 * * *'
+    - cron: '30 22 * * *'
 
   # 수동 실행 버튼
   workflow_dispatch:
