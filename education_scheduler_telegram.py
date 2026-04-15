@@ -285,9 +285,9 @@ def get_auto_synced_events(cal_service):
                     dt = datetime.fromisoformat(dt_str.replace('Z', '+00:00')).astimezone(KST)
                 else:
                     dt = datetime.fromisoformat(dt_str)
-                date_key = dt.strftime('%Y-%m-%d')
+                date_key = dt.strftime('%Y-%m-%d %H:%M')
             elif 'date' in start:
-                date_key = start['date']
+                date_key = start['date'] + " 00:00"
             else:
                 continue
 
@@ -456,10 +456,10 @@ def main():
             unique.append(s)
             seen.add(key)
 
-    # 시트 일정 → (이름, 날짜) 매핑
+    # 시트 일정 → (이름, 날짜+시간) 매핑
     sheet_events = {}
     for s in unique:
-        date_key = s['datetime'].strftime('%Y-%m-%d')
+        date_key = s['datetime'].strftime('%Y-%m-%d %H:%M')
         key = (s['name'], date_key)
         sheet_events[key] = s
 
@@ -548,12 +548,14 @@ def main():
     if changes:
         report += f"🔄 일정 변경: <b>{len(changes)}</b>개\n\n"
         for c in changes[:5]:
-            old_dt = datetime.strptime(c['old_date'], '%Y-%m-%d')
-            new_dt = datetime.strptime(c['new_date'], '%Y-%m-%d')
+            old_d = c['old_date'].split(' ')[0]
+            new_d = c['new_date'].split(' ')[0]
+            old_dt = datetime.strptime(old_d, '%Y-%m-%d')
+            new_dt = datetime.strptime(new_d, '%Y-%m-%d')
             old_day = DAY_NAMES[old_dt.weekday()]
             new_day = DAY_NAMES[new_dt.weekday()]
             report += f"🔄 <b>{c['name']}</b>\n"
-            report += f"   {c['old_date']}({old_day}) → {c['new_date']}({new_day})\n"
+            report += f"   {old_d}({old_day}) → {new_d}({new_day})\n"
         if len(changes) > 5:
             report += f"   ... 외 {len(changes) - 5}건\n"
     elif deleted_count > 0 or added_count > 0:
