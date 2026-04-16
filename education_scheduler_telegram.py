@@ -382,13 +382,9 @@ def get_upcoming_3days_report(cal_service):
         ).execute()
 
         events = events_result.get('items', [])
-        if not events:
-            return "📋 3일 내 예정된 일정 없음\n\n"
 
-        report = "📋 <b>앞으로 3일간 일정 (캘린더)</b>\n"
-        report += "-" * 30 + "\n"
-
-        current_date = None
+        # 이벤트를 날짜별로 그룹화
+        events_by_date = {}
         for event in events:
             start = event.get('start', {})
             if 'dateTime' in start:
@@ -405,17 +401,32 @@ def get_upcoming_3days_report(cal_service):
                 continue
 
             date_key = dt.strftime('%Y-%m-%d')
-            if date_key != current_date:
-                current_date = date_key
-                day_name = DAY_NAMES[dt.weekday()]
-                report += f"\n<b>📆 {dt.strftime('%m/%d')}({day_name})</b>\n"
+            if date_key not in events_by_date:
+                events_by_date[date_key] = []
+            events_by_date[date_key].append({
+                'time_str': time_str,
+                'summary': event.get('summary', '(제목 없음)'),
+                'location': event.get('location', '')
+            })
 
-            summary = event.get('summary', '(제목 없음)')
-            location = event.get('location', '')
-            report += f"  ▪️ {time_str} {summary}\n"
-            if location:
-                encoded = urllib.parse.quote(location)
-                report += f"      📍 <a href=\"https://map.naver.com/v5/search/{encoded}\">{location}</a>\n"
+        report = "📋 <b>앞으로 3일간 일정 (캘린더)</b>\n"
+        report += "-" * 30 + "\n"
+
+        # 오늘부터 4일간 모든 날짜 순회 (일정 없어도 표시)
+        for day_offset in range(4):
+            day_dt = today_start + timedelta(days=day_offset)
+            date_key = day_dt.strftime('%Y-%m-%d')
+            day_name = DAY_NAMES[day_dt.weekday()]
+            report += f"\n<b>📆 {day_dt.strftime('%m/%d')}({day_name})</b>\n"
+
+            if date_key in events_by_date:
+                for ev in events_by_date[date_key]:
+                    report += f"  ▪️ {ev['time_str']} {ev['summary']}\n"
+                    if ev['location']:
+                        encoded = urllib.parse.quote(ev['location'])
+                        report += f"      📍 <a href=\"https://map.naver.com/v5/search/{encoded}\">{ev['location']}</a>\n"
+            else:
+                report += f"  ▫️ 일정 없음\n"
 
         report += "\n"
         return report
