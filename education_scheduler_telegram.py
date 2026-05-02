@@ -331,9 +331,16 @@ def main():
             seen.add(key)
     unique_schedules.sort(key=lambda x: x['datetime'])
 
-    print(f"\n📅 {len(unique_schedules)}개 일정 처리 중...\n")
+    # 오늘 이후 일정만 필터링 (한국 시각 기준 오늘 0시부터)
+    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    future_schedules = [s for s in unique_schedules if s['datetime'] >= today_start]
+    skipped_past = len(unique_schedules) - len(future_schedules)
+    if skipped_past > 0:
+        print(f"⏭️  과거 일정 {skipped_past}개 제외 (오늘 이전)")
+
+    print(f"\n📅 {len(future_schedules)}개 일정 처리 중...\n")
     added_count = 0
-    for s in unique_schedules:
+    for s in future_schedules:
         d = s['datetime'].strftime('%Y-%m-%d %H:%M')
         # 캘린더에 이미 있는지 확인
         if event_already_exists(calendar_service, s['name'], s['datetime']):
@@ -344,11 +351,11 @@ def main():
             added_count += 1
 
     print("=" * 50)
-    print(f"✅ 추가됨: {added_count}개 / 발견: {len(unique_schedules)}개")
+    print(f"✅ 추가됨: {added_count}개 / 미래 일정: {len(future_schedules)}개 / 전체 발견: {len(unique_schedules)}개")
     print("=" * 50)
 
-    save_log(unique_schedules)
-    send_telegram_message(create_telegram_report(added_count, unique_schedules, previous_log))
+    save_log(future_schedules)
+    send_telegram_message(create_telegram_report(added_count, future_schedules, previous_log))
 
 
 if __name__ == "__main__":
