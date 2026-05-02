@@ -26,6 +26,7 @@ jobs:
 
       - name: 동기화 실행
         env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TOKEN_PICKLE_BASE64: ${{ secrets.TOKEN_PICKLE_BASE64 }}
           CREDENTIALS_JSON: ${{ secrets.CREDENTIALS_JSON }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
