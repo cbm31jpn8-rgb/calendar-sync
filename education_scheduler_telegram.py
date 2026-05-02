@@ -214,8 +214,8 @@ def find_all_schedules(service, sheet_id, target_name):
     print(f"\n🔍 '{target_name}' 검색 중...\n")
     out = []
     out.extend(find_in_staff_sheet(service, sheet_id, target_name))
-    out.extend(find_in_academic_sheet(service, sheet_id, "2.학술", target_name))
-    out.extend(find_in_academic_sheet(service, sheet_id, "3.CPR교육", target_name))
+    out.extend(find_in_academic_sheet(service, sheet_id, "3.학술", target_name))
+    out.extend(find_in_academic_sheet(service, sheet_id, "CPR교육일정", target_name))
     return out
 
 
