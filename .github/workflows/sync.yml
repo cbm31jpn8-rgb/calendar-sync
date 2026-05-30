@@ -1,17 +1,12 @@
 #!/usr/bin/env python3
 """
 GitHub Actions 버전 - 스마트 동기화
-
 Google Sheets ↔ Google Calendar 비교 후 변경분만 처리
 자동 추가된 이벤트에 [자동동기화] 태그를 붙여서 수동 이벤트와 구분
 
-수정 내용:
-1) 1.스탭 탭을 A:I가 아니라 A:AZ까지 읽음
-2) 날짜가 1~2개만 있는 날짜행도 인식
-3) 병합 셀/왼쪽 날짜 셀 구조 대응
-4) 8a-6p, 6p-8a 근무 슬롯 안정적으로 파싱
-5) 같은 날짜/같은 제목의 기존 캘린더 이벤트도 description/location 업데이트
-6) 1.스탭 월별 근무 개수 보고를 텔레그램에 포함
+추가 기능:
+- 1.스탭 탭에서 TARGET_NAME이 월별로 몇 개 근무에 들어가 있는지 집계
+- 텔레그램 보고서에 월별 근무 개수 포함
 """
 
 import os
@@ -23,6 +18,7 @@ from googleapiclient.discovery import build
 from datetime import datetime, timedelta, timezone
 import re
 import requests
+import json
 import urllib.parse
 
 # ===== 한국 시간대 =====
@@ -31,22 +27,17 @@ DAY_NAMES = ['월', '화', '수', '목', '금', '토', '일']
 SYNC_TAG = "[자동동기화]"
 
 # ===== 설정 =====
-SHARED_SHEET_ID = os.environ.get(
-    "SHARED_SHEET_ID",
-    "1KYTCcWQ_Ctfy72H7w-aVgJMdFGBWjS2HrOVcLgKjOOQ"
-)
-TARGET_NAME = os.environ.get("TARGET_NAME", "재희")
-YEAR = int(os.environ.get("YEAR", "2026"))
+SHARED_SHEET_ID = "1KYTCcWQ_Ctfy72H7w-aVgJMdFGBWjS2HrOVcLgKjOOQ"
+TARGET_NAME = "재희"
+YEAR = 2026
 
-# False: YEAR 전체 근무 개수
+# 월별 근무 개수 보고 범위
+# False: 2026년 전체 근무 개수
 # True: 오늘 이후 남은 근무 개수만 계산
-STAFF_MONTHLY_REPORT_FUTURE_ONLY = os.environ.get(
-    "STAFF_MONTHLY_REPORT_FUTURE_ONLY",
-    "false"
-).lower() == "true"
+STAFF_MONTHLY_REPORT_FUTURE_ONLY = False
 
 # ===== 텔레그램 설정 =====
-# 토큰은 코드에 직접 넣지 말고 GitHub Secrets에 넣으세요.
+# 보안상 토큰은 코드에 직접 넣지 말고 GitHub Secrets에 넣는 것을 권장
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
@@ -86,97 +77,21 @@ def authenticate():
     return creds
 
 # ==========================================================
-# 날짜/시간 파싱
+# 날짜 파싱
 # ==========================================================
 
 def parse_date_staff(date_str, year=2026):
-    """
-    1.스탭 날짜 파싱
-
-    지원 형식:
-    - 6월 1일
-    - 6월1일
-    - 2026.6.1
-    - 2026-6-1
-    - 2026/6/1
-    - 6.1
-    - 6/1
-    """
-    s = str(date_str or "").replace("\u00a0", " ").strip()
-
-    # 2026.6.1 / 2026-6-1 / 2026/6/1
-    match = re.search(r'(\d{4})[.\-/]\s*(\d{1,2})[.\-/]\s*(\d{1,2})', s)
-    if match:
-        try:
-            return datetime(
-                int(match.group(1)),
-                int(match.group(2)),
-                int(match.group(3))
-            )
-        except ValueError:
-            return None
-
-    # 6월 1일 / 6월1일
-    match = re.search(r'(\d{1,2})\s*월\s*(\d{1,2})\s*일', s)
+    match = re.match(r'(\d{1,2})월\s*(\d{1,2})일', date_str.strip())
     if match:
         try:
             return datetime(year, int(match.group(1)), int(match.group(2)))
         except ValueError:
             return None
-
-    # 6.1 / 6/1
-    match = re.search(r'(?<!\d)(\d{1,2})[./]\s*(\d{1,2})(?!\d)', s)
-    if match:
-        try:
-            return datetime(year, int(match.group(1)), int(match.group(2)))
-        except ValueError:
-            return None
-
     return None
 
-
-def parse_staff_slot(slot_text):
-    """
-    1.스탭 근무 슬롯 파싱
-
-    예:
-    - 8a-6p   -> 08:00 시작, 10시간
-    - 6p-8a   -> 18:00 시작, 14시간
-    - 8A - 6P -> 08:00 시작, 10시간
-    """
-    raw = str(slot_text or "8a-6p").strip()
-    normalized = raw.lower().replace(" ", "")
-
-    match = re.search(r'(\d{1,2})([ap])-(\d{1,2})([ap])', normalized)
-    if not match:
-        return 8, 10, "8a-6p"
-
-    start_h = int(match.group(1))
-    start_ap = match.group(2)
-    end_h = int(match.group(3))
-    end_ap = match.group(4)
-
-    def to_24h(hour, ap):
-        if ap == 'a':
-            return 0 if hour == 12 else hour
-        return 12 if hour == 12 else hour + 12
-
-    start_hour = to_24h(start_h, start_ap)
-    end_hour = to_24h(end_h, end_ap)
-
-    if end_hour <= start_hour:
-        end_hour += 24
-
-    duration_hours = end_hour - start_hour
-    clean_slot = f"{start_h}{start_ap}-{end_h}{end_ap}"
-
-    return start_hour, duration_hours, clean_slot
-
-
 def parse_datetime_cpr(date_str):
-    date_str = str(date_str or "").strip()
+    date_str = date_str.strip()
     date_match = re.match(r'(\d{4})\.?\s*(\d{1,2})\.?\s*(\d{1,2})', date_str)
-
     if not date_match:
         return None
 
@@ -185,7 +100,6 @@ def parse_datetime_cpr(date_str):
     day = int(date_match.group(3))
 
     time_match = re.search(r'(\d{1,2}):(\d{2})', date_str)
-
     if time_match:
         hour = int(time_match.group(1))
         minute = int(time_match.group(2))
@@ -198,11 +112,8 @@ def parse_datetime_cpr(date_str):
     except ValueError:
         return None
 
-
 def parse_datetime_academic(date_str):
-    s = str(date_str or "").strip()
-    match = re.match(r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})', s)
-
+    match = re.match(r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})', date_str.strip())
     if match:
         try:
             return datetime(
@@ -212,7 +123,6 @@ def parse_datetime_academic(date_str):
             )
         except ValueError:
             return None
-
     return None
 
 # ==========================================================
@@ -225,130 +135,78 @@ def find_in_staff_sheet(service, sheet_id, target_name):
     try:
         sheet = service.spreadsheets().values().get(
             spreadsheetId=sheet_id,
-            range="'1.스탭'!A:AZ"
+            range="'1.스탭'!A:I"
         ).execute()
 
         values = sheet.get('values', [])
         if not values:
             return schedules
 
-        max_cols = max((len(row) for row in values), default=0)
-        print(f"📊 1.스탭 탭: {len(values)}행 x 최대 {max_cols}열 읽음")
+        print(f"📊 1.스탭 탭: {len(values)}행 읽음")
 
         # 날짜가 들어 있는 행 찾기
         date_rows = {}
-
         for row_idx, row in enumerate(values):
             row_dates = {}
 
-            # C열부터 마지막 열까지 전체 검색
-            for col_idx in range(2, len(row)):
-                cell = str(row[col_idx] or "").strip()
+            for col_idx in range(2, min(len(row), 9)):
+                cell = row[col_idx].strip() if col_idx < len(row) and row[col_idx] else ""
                 parsed = parse_date_staff(cell, YEAR)
 
                 if parsed:
                     row_dates[col_idx] = parsed
 
-            # 날짜가 1개만 있는 행도 날짜행으로 인정
-            if row_dates:
+            if len(row_dates) >= 3:
                 date_rows[row_idx] = row_dates
 
         # 근무 시간 슬롯이 들어 있는 행 찾기
         time_slots = {}
-
         for row_idx, row in enumerate(values):
             if len(row) > 1:
-                b_cell = str(row[1] or "").strip()
+                b_cell = row[1].strip() if row[1] else ""
 
-                if re.search(
-                    r'\d{1,2}\s*[ap]\s*-\s*\d{1,2}\s*[ap]',
-                    b_cell,
-                    re.IGNORECASE
-                ):
+                if re.match(r'\d+[ap]-\d+[ap]', b_cell, re.IGNORECASE):
                     time_slots[row_idx] = b_cell
-
-        def find_date_for_cell(target_row_idx, target_col_idx):
-            """
-            target 셀 위쪽에서 가장 가까운 날짜행을 찾습니다.
-
-            1순위: 같은 열에 있는 날짜
-            2순위: 같은 날짜행에서 target_col_idx 왼쪽의 가장 가까운 날짜
-            """
-            for dr_idx in sorted(date_rows.keys(), reverse=True):
-                if dr_idx >= target_row_idx:
-                    continue
-
-                row_dates = date_rows[dr_idx]
-
-                if target_col_idx in row_dates:
-                    return row_dates[target_col_idx]
-
-                left_cols = [c for c in row_dates.keys() if c <= target_col_idx]
-                if left_cols:
-                    nearest_left_col = max(left_cols)
-                    return row_dates[nearest_left_col]
-
-            return None
-
-        def find_slot_for_row(target_row_idx):
-            """
-            target 행 위쪽에서 가장 가까운 근무 슬롯을 찾습니다.
-            """
-            found_slot = "8a-6p"
-
-            for ts_idx in sorted(time_slots.keys(), reverse=True):
-                if ts_idx <= target_row_idx:
-                    found_slot = time_slots[ts_idx]
-                    break
-
-            return found_slot
 
         # target_name 검색
         for row_idx, row in enumerate(values):
-            for col_idx in range(2, len(row)):
-                cell_str = str(row[col_idx] or "").strip()
+            for col_idx in range(2, min(len(row), 9)):
+                cell_str = row[col_idx].strip() if col_idx < len(row) and row[col_idx] else ""
 
                 if target_name not in cell_str:
                     continue
 
-                found_date = find_date_for_cell(row_idx, col_idx)
+                # 해당 셀 위쪽에서 가장 가까운 날짜 찾기
+                found_date = None
+                for dr_idx in sorted(date_rows.keys(), reverse=True):
+                    if dr_idx < row_idx and col_idx in date_rows[dr_idx]:
+                        found_date = date_rows[dr_idx][col_idx]
+                        break
 
-                if not found_date:
-                    print(
-                        f"⚠️  1.스탭 날짜 못 찾음: "
-                        f"row={row_idx + 1}, col={col_idx + 1}, value={cell_str}"
-                    )
-                    continue
+                # 해당 행 위쪽에서 가장 가까운 근무 시간 찾기
+                found_slot = "8a-6p"
+                for ts_idx in sorted(time_slots.keys(), reverse=True):
+                    if ts_idx <= row_idx:
+                        found_slot = time_slots[ts_idx]
+                        break
 
-                raw_slot = find_slot_for_row(row_idx)
-                start_hour, duration_hours, clean_slot = parse_staff_slot(raw_slot)
+                if found_date:
+                    start_part = found_slot.lower().split('-')[0]
+                    start_hour = 8 if '8a' in start_part else 18
+                    event_dt = found_date.replace(hour=start_hour, minute=0)
 
-                event_dt = found_date.replace(hour=start_hour, minute=0)
-
-                schedules.append({
-                    'sheet': '1.스탭',
-                    'name': f"근무 ({clean_slot})",
-                    'datetime': event_dt,
-                    'slot': clean_slot,
-                    'duration_hours': duration_hours,
-                    'location': '',
-                    'details': (
-                        f"근무: {clean_slot}, "
-                        f"{found_date.strftime('%m월 %d일')}, "
-                        f"함께: {cell_str}"
-                    )
-                })
-
-        print(f"✅ 1.스탭에서 {target_name} 일정 {len(schedules)}개 발견")
-
-        for s in schedules[:20]:
-            print(
-                f"  - {s['datetime'].strftime('%Y-%m-%d %H:%M')} "
-                f"{s['name']} | {s['details']}"
-            )
-
-        if len(schedules) > 20:
-            print(f"  ... 외 {len(schedules) - 20}개")
+                    schedules.append({
+                        'sheet': '1.스탭',
+                        'name': f"근무 ({found_slot})",
+                        'datetime': event_dt,
+                        'slot': found_slot,
+                        'location': '',
+                        'details': (
+                            f"근무: {found_slot}, "
+                            f"{found_date.strftime('%m월 %d일')}, "
+                            f"함께: {cell_str}"
+                        )
+                    })
 
     except Exception as e:
         print(f"⚠️  1.스탭 오류: {e}")
@@ -423,13 +281,11 @@ def find_in_academic_sheet(service, sheet_id, target_name):
         print(f"📊 3.학술 탭: {len(values)}행 읽음")
 
         date_rows = {}
-
         for row_idx, row in enumerate(values):
             row_dates = {}
 
             for col_idx, cell in enumerate(row):
                 parsed = parse_datetime_academic(cell.strip() if cell else "")
-
                 if parsed:
                     row_dates[col_idx] = parsed
 
@@ -444,7 +300,6 @@ def find_in_academic_sheet(service, sheet_id, target_name):
                     continue
 
                 found_date = None
-
                 for dr_idx in sorted(date_rows.keys(), reverse=True):
                     if dr_idx < row_idx and col_idx in date_rows[dr_idx]:
                         found_date = date_rows[dr_idx][col_idx]
@@ -487,11 +342,18 @@ def get_staff_monthly_work_report(schedules, future_only=False):
     """
     1.스탭 탭에서 찾은 TARGET_NAME의 월별 근무 개수 보고서 생성
 
+    future_only=False:
+        YEAR 전체 근무 개수 계산
+
+    future_only=True:
+        오늘 이후 남은 근무 개수만 계산
+
     계산 기준:
     - sheet == '1.스탭'인 일정만 계산
     - 같은 날짜 + 같은 근무 슬롯은 1개로 계산
     - 같은 날짜에 8a-6p, 6p-8a처럼 슬롯이 다르면 각각 1개로 계산
     """
+
     now_kst = datetime.now(KST)
     today = now_kst.replace(
         hour=0,
@@ -537,7 +399,6 @@ def get_staff_monthly_work_report(schedules, future_only=False):
     report += "-" * 30 + "\n"
 
     total = 0
-
     for month in range(1, 13):
         count = monthly_counts.get(month, 0)
         total += count
@@ -552,9 +413,8 @@ def get_staff_monthly_work_report(schedules, future_only=False):
 # ==========================================================
 
 def get_auto_synced_events(cal_service):
-    """
-    캘린더에서 [자동동기화] 태그가 있는 미래 이벤트 가져오기
-    """
+    """캘린더에서 [자동동기화] 태그가 있는 미래 이벤트 가져오기"""
+
     try:
         now_kst = datetime.now(KST)
         today_start = now_kst.replace(
@@ -607,8 +467,7 @@ def get_auto_synced_events(cal_service):
                 'event_id': event['id'],
                 'summary': summary,
                 'date_key': date_key,
-                'location': event.get('location', ''),
-                'description': desc
+                'location': event.get('location', '')
             }
 
         print(f"📅 캘린더에서 자동동기화 이벤트 {len(auto_events)}개 조회됨")
@@ -649,7 +508,6 @@ def add_event_to_calendar(service, name, dt, details, duration_hours=1, location
         print(f"❌ 추가 오류: {e}")
         return None
 
-
 def delete_event_from_calendar(service, event_id):
     try:
         service.events().delete(
@@ -663,56 +521,29 @@ def delete_event_from_calendar(service, event_id):
         print(f"❌ 삭제 오류: {e}")
         return False
 
-
-def update_event_description_and_location(service, event_id, details, location=""):
-    """
-    캘린더에 이미 있는 자동동기화 이벤트의 description/location 업데이트.
-
-    같은 날짜, 같은 제목이라도
-    1.스탭의 '함께 근무자' 내용이 바뀌면 반영되도록 합니다.
-    """
+def update_event_location(service, event_id, location):
     try:
         event = service.events().get(
             calendarId='primary',
             eventId=event_id
         ).execute()
 
-        changed = False
-        details_changed = False
-        location_changed = False
+        event['location'] = location
 
-        new_description = f"{SYNC_TAG}\n{details}"
-        old_description = event.get('description', '')
+        if SYNC_TAG not in event.get('description', ''):
+            event['description'] = f"{SYNC_TAG}\n{event.get('description', '')}"
 
-        if old_description != new_description:
-            event['description'] = new_description
-            changed = True
-            details_changed = True
+        service.events().update(
+            calendarId='primary',
+            eventId=event_id,
+            body=event
+        ).execute()
 
-        old_location = event.get('location', '') or ""
-        new_location = location or ""
-
-        if old_location != new_location:
-            if new_location:
-                event['location'] = new_location
-            else:
-                event.pop('location', None)
-
-            changed = True
-            location_changed = True
-
-        if changed:
-            service.events().update(
-                calendarId='primary',
-                eventId=event_id,
-                body=event
-            ).execute()
-
-        return details_changed, location_changed
+        return True
 
     except Exception as e:
-        print(f"❌ 내용/위치 업데이트 오류: {e}")
-        return False, False
+        print(f"❌ 위치 업데이트 오류: {e}")
+        return False
 
 # ==========================================================
 # 텔레그램
@@ -737,7 +568,7 @@ def send_telegram_message(message):
             'disable_web_page_preview': 'true'
         }
 
-        resp = requests.post(url, data=payload, timeout=20)
+        resp = requests.post(url, data=payload)
 
         if resp.status_code == 200:
             print("📱 텔레그램 발송 완료!")
@@ -773,6 +604,7 @@ def get_upcoming_3days_report(cal_service):
 
         events = events_result.get('items', [])
 
+        # 이벤트를 날짜별로 그룹화
         events_by_date = {}
 
         for event in events:
@@ -869,7 +701,8 @@ def main():
     )
 
     # 1-1) 1.스탭 월별 근무 개수 보고서 생성
-    # 전체 월별 개수를 보려면 미래 일정 필터링 전에 계산해야 합니다.
+    # 중요:
+    # 월별 전체 근무 개수를 세려면, 아래 미래 일정 필터링 전에 계산해야 함
     staff_monthly_report = get_staff_monthly_work_report(
         schedules,
         future_only=STAFF_MONTHLY_REPORT_FUTURE_ONLY
@@ -979,7 +812,8 @@ def main():
         loc = s.get('location', '')
 
         if s['sheet'] == '1.스탭':
-            dur = s.get('duration_hours', 10)
+            start_part = s.get('slot', '8a-6p').lower().split('-')[0]
+            dur = 10 if '8a' in start_part else 14
 
         elif s['sheet'] == 'CPR교육일정':
             dur = 2
@@ -1000,8 +834,7 @@ def main():
             added_count += 1
             added_items.append(f"{s['datetime'].strftime('%Y-%m-%d')} {name}")
 
-    # 6) 유지 이벤트 내용/위치 업데이트
-    details_updated = 0
+    # 6) 유지 이벤트 위치 업데이트
     loc_updated = 0
 
     for key in unchanged:
@@ -1009,18 +842,9 @@ def main():
         cal_ev = cal_events[key]
         loc = s.get('location', '')
 
-        details_changed, location_changed = update_event_description_and_location(
-            cal_svc,
-            cal_ev['event_id'],
-            s['details'],
-            loc
-        )
-
-        if details_changed:
-            details_updated += 1
-
-        if location_changed:
-            loc_updated += 1
+        if loc and not cal_ev.get('location'):
+            if update_event_location(cal_svc, cal_ev['event_id'], loc):
+                loc_updated += 1
 
     # 7) 텔레그램 보고
     now_kst = datetime.now(KST)
@@ -1033,14 +857,8 @@ def main():
     report += f"✅ 변동 없음: <b>{len(unchanged)}</b>개\n"
     report += f"➖ 삭제됨: <b>{deleted_count}</b>개\n"
 
-    if details_updated > 0:
-        report += f"📝 내용 업데이트: <b>{details_updated}</b>개\n"
-
-    if loc_updated > 0:
-        report += f"📍 위치 업데이트: <b>{loc_updated}</b>개\n"
-
     if changes:
-        report += f"\n🔄 일정 변경: <b>{len(changes)}</b>개\n\n"
+        report += f"🔄 일정 변경: <b>{len(changes)}</b>개\n\n"
 
         for c in changes[:5]:
             old_d = c['old_date'].split(' ')[0]
@@ -1079,6 +897,9 @@ def main():
             if len(added_items) > 5:
                 report += f"   ... 외 {len(added_items) - 5}개\n"
 
+    if loc_updated > 0:
+        report += f"\n📍 위치 업데이트: {loc_updated}개\n"
+
     # 월별 근무 개수 보고 추가
     report += "\n"
     report += staff_monthly_report
@@ -1095,11 +916,8 @@ def main():
         f"추가 {added_count}, "
         f"삭제 {deleted_count}, "
         f"유지 {len(unchanged)}, "
-        f"내용업데이트 {details_updated}, "
-        f"위치업데이트 {loc_updated}, "
         f"변경 {len(changes)}"
     )
-
 
 if __name__ == "__main__":
     main()
