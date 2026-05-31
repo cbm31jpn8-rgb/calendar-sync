@@ -3,7 +3,8 @@ name: Schedule Sync
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */3 * * *"
+    - cron: "09 5 * * *"
+      timezone: "Asia/Seoul"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
